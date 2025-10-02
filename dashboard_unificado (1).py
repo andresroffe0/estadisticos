@@ -1,59 +1,17 @@
-"""
-Dashboard unificado de series temporales SHF
--------------------------------------------
-
-Este script combina lo mejor de dos implementaciones previas de dashboards:
-`improved_dashboard_Version2.py` y `prueba_estadisticos6 (2).py`.  La
-principal mejora es la robustez en la carga de datos (manejo de delimitadores
-de CSV, codificaciones y formatos de fecha), la detección inteligente de
-columnas de fecha, valor y categoría, y la generación de visualizaciones
-interactivas con descomposición de series temporales que selecciona
-automáticamente el modo aditivo o multiplicativo minimizando el error.
-
-Características destacadas
-~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-* **Carga de datos flexible**: admite CSV, Excel y Parquet.  Para archivos
-  CSV se intenta varias codificaciones y se detecta el delimitador.
-* **Detección de columnas**: sugiere automáticamente columnas de fecha,
-  valor (numéricas) y categoría, con la opción de especificar un formato de
-  fecha personalizado.
-* **Análisis robusto de fechas**: reconoce cuando una columna contiene
-  años (e.g. "2000") y los convierte a fechas («2000-01-01»).  También
-  intenta detectar el formato de fecha cuando el análisis automático falla.
-* **Preprocesamiento con caché**: convierte columnas de valor a numérico,
-  crea una columna de categoría predeterminada si no se especifica una,
-  calcula tasas de crecimiento y etiquetas de periodo según la frecuencia
-  seleccionada.
-* **Opciones avanzadas**: permite filtrar por rango de fechas y detectar
-  valores atípicos mediante z-score (opcional).
-* **Descomposición automática**: utiliza la librería `darts` para extraer
-  tendencia y estacionalidad, eligiendo el modo (aditivo/multiplicativo)
-  según el error de reconstrucción.  El resultado se muestra en un
-  dashboard interactivo con Plotly.
-
-Para ejecutar este archivo en un entorno local, utiliza el comando:
-
-```
-streamlit run dashboard_unificado.py
-```
-
-Se requiere tener instaladas las dependencias: `streamlit`, `pandas`,
+"""Se requiere tener instaladas las dependencias: `streamlit`, `pandas`,
 `numpy`, `plotly`, `darts` y `openpyxl` (para Excel).
 """
 
 import calendar
-import re
 from datetime import datetime
 import warnings
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, List, Optional
 
+import altair as alt
 import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
 from darts import TimeSeries
 from darts.utils.statistics import ModelMode, extract_trend_and_seasonality
-from plotly.subplots import make_subplots
 import streamlit as st
 
 
@@ -61,7 +19,11 @@ import streamlit as st
 # Configuración inicial y supresión de advertencias
 # -----------------------------------------------------------------------------
 # Configurar la página de Streamlit
-st.set_page_config(page_title="📊 Dashboard SHF", layout="wide", page_icon="📊")
+st.set_page_config(page_title="Línea de Tiempo", layout="wide", page_icon="📊")
+
+# Configuración global de Altair para evitar límites de filas y simplificar la estética
+alt.data_transformers.disable_max_rows()
+alt.renderers.set_embed_options(actions=False)
 
 # Suprimir advertencias específicas de Darts que pueden ser ruidosas
 warnings.filterwarnings("ignore", message=".*frequency of the time series is*")
@@ -71,6 +33,19 @@ warnings.filterwarnings("ignore", message=".*Series has NaN values.*")
 # -----------------------------------------------------------------------------
 # Funciones utilitarias de procesamiento de datos y detección de columnas
 # -----------------------------------------------------------------------------
+
+GROWTH_OFFSETS_BY_FREQ = {
+    "A": {"YoY": pd.DateOffset(years=1)},
+    "Q": {"QoQ": pd.DateOffset(months=3), "YoY": pd.DateOffset(years=1)},
+    "M": {"MoM": pd.DateOffset(months=1), "YoY": pd.DateOffset(years=1)},
+    "W": {"WoW": pd.DateOffset(weeks=1), "YoY": pd.DateOffset(years=1)},
+    "D": {
+        "DoD": pd.DateOffset(days=1),
+        "WoW": pd.DateOffset(weeks=1),
+        "MoM": pd.DateOffset(months=1),
+        "YoY": pd.DateOffset(years=1),
+    },
+}
 
 @st.cache_data
 def convert_df(df: pd.DataFrame) -> bytes:
@@ -205,52 +180,6 @@ def parse_dates(
     return dates
 
 
-def guess_numeric_columns(df: pd.DataFrame) -> List[str]:
-    """Devuelve una lista de columnas que probablemente contienen valores numéricos."""
-    numerics = df.select_dtypes(include=["number"]).columns.tolist()
-    # Verificar si columnas de texto pueden convertirse a números
-    for col in df.select_dtypes(include=["object"]).columns:
-        sample = df[col].dropna().head(10)
-        if not sample.empty:
-            try:
-                sample.astype(float)
-                numerics.append(col)
-            except Exception:
-                pass
-    return numerics
-
-
-def guess_date_columns(df: pd.DataFrame) -> List[str]:
-    """Devuelve una lista de columnas que probablemente contienen fechas."""
-    date_cols: List[str] = df.select_dtypes(include=["datetime"]).columns.tolist()
-    # Verificar otras columnas de tipo objeto con patrones de fecha
-    date_pattern = r"\d{1,4}[-/\. ]\d{1,2}[-/\. ]\d{1,4}|\d{1,2}\s+[a-zA-Z]{3,9}\s+\d{2,4}"
-    for col in df.select_dtypes(include=["object", "int64", "float64"]).columns:
-        if col in date_cols:
-            continue
-        sample = df[col].dropna().astype(str).head(10)
-        if not sample.empty:
-            matches = [bool(re.search(date_pattern, str(x))) for x in sample]
-            # Si la mayoría de la muestra coincide con el patrón, considerarla fecha
-            if sample.dtype != "datetime64[ns]" and sum(matches) / len(matches) > 0.5:
-                date_cols.append(col)
-    return date_cols
-
-
-def guess_category_columns(
-    df: pd.DataFrame, min_categories: int = 2, max_categories: int = 30
-) -> List[str]:
-    """Devuelve una lista de columnas que probablemente sean categóricas."""
-    cols: List[str] = []
-    for col in df.columns:
-        nunique = df[col].nunique(dropna=True)
-        if (df[col].dtype == "object" and nunique <= max_categories) or (
-            min_categories <= nunique <= max_categories
-        ):
-            cols.append(col)
-    return cols
-
-
 def add_period_labels(df: pd.DataFrame, freq: str) -> pd.DataFrame:
     """Añade una columna 'Periodo' con etiquetas legibles según la frecuencia."""
     if freq == "Q":
@@ -313,10 +242,6 @@ def preprocess_data(
     df_proc = df_proc.sort_values([col_cat, "Fecha"]).reset_index(drop=True)
     # Añadir etiquetas de periodo
     df_proc = add_period_labels(df_proc, freq)
-    # Calcular crecimiento
-    df_proc["log_ind"] = np.log(df_proc[col_valor].replace(0, np.nan))
-    df_proc["log_lag"] = df_proc.groupby(col_cat, observed=True)["log_ind"].diff()
-    df_proc["g"] = (np.exp(df_proc["log_lag"]) - 1) * 100
     return df_proc
 
 
@@ -382,10 +307,61 @@ def has_outliers(series: pd.Series, threshold: float = 3.0) -> bool:
     return (z_scores > threshold).any()
 
 
+def calculate_growth(
+    df: pd.DataFrame,
+    cat_col: str,
+    value_col: str,
+    freq: str,
+    growth_type: str,
+) -> pd.DataFrame:
+    """Calcula la variación porcentual alineada a periodos calendario.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Datos procesados que incluyen las columnas de categoría y fecha.
+    cat_col : str
+        Nombre de la columna que identifica la categoría.
+    value_col : str
+        Nombre de la columna con los valores numéricos.
+    freq : str
+        Frecuencia seleccionada ("A", "Q", "M", "W" o "D").
+    growth_type : str
+        Métrica de crecimiento a calcular (por ejemplo, "YoY", "QoQ").
+
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame con las columnas `Fecha`, la categoría y la variación porcentual
+        etiquetada como `Crecimiento`.
+    """
+
+    offsets = GROWTH_OFFSETS_BY_FREQ.get(freq, {})
+    offset = offsets.get(growth_type)
+    if offset is None:
+        return pd.DataFrame(columns=["Fecha", cat_col, "Crecimiento"])
+
+    growth_frames: List[pd.DataFrame] = []
+    for categoria, grupo in df.groupby(cat_col):
+        if grupo.empty:
+            continue
+        serie = grupo.sort_values("Fecha").set_index("Fecha")[value_col]
+        comparativo = serie.shift(freq=offset)
+        crecimiento = (serie / comparativo - 1) * 100
+        temp = crecimiento.rename("Crecimiento").reset_index()
+        temp[cat_col] = categoria
+        growth_frames.append(temp)
+
+    if not growth_frames:
+        return pd.DataFrame(columns=["Fecha", cat_col, "Crecimiento"])
+
+    return pd.concat(growth_frames, ignore_index=True)
+
+
 def main() -> None:
     """Función principal que construye la interfaz y ejecuta el flujo del dashboard."""
     # Cabecera de la aplicación
-    st.title("📊 Dashboard SHF Interactivo")
+    st.title("Línea de Tiempo")
     # Añadir logo corporativo de Realytics para una identidad visual coherente
     try:
         st.image("realytics.jpg", width=150)
@@ -461,24 +437,24 @@ def main() -> None:
                 )
             # Selección de columnas con disposición horizontal para una interfaz más compacta
             st.subheader("Selección de columnas")
-            date_cols = guess_date_columns(df)
-            numeric_cols = guess_numeric_columns(df)
-            category_cols = guess_category_columns(df)
+            all_columns = df.columns.tolist()
             sel_col1, sel_col2, sel_col3, sel_col4 = st.columns(4)
             with sel_col1:
-                col_fecha = st.selectbox(
-                    "Fecha", options=date_cols + [c for c in df.columns if c not in date_cols], key="col_fecha"
-                )
+                col_fecha = st.selectbox("Fecha", options=all_columns, key="col_fecha")
+            remaining_for_value = [c for c in all_columns if c != col_fecha]
+            if not remaining_for_value:
+                st.error("Selecciona un archivo que contenga al menos otra columna para el valor numérico.")
+                return
             with sel_col2:
-                col_valor = st.selectbox(
-                    "Valor", options=numeric_cols + [c for c in df.columns if c not in numeric_cols], key="col_valor"
-                )
+                col_valor = st.selectbox("Valor", options=remaining_for_value, key="col_valor")
+            remaining_for_category = [c for c in all_columns if c not in {col_fecha, col_valor}]
             with sel_col3:
-                col_cat = st.selectbox(
-                    "Categoría", options=["[No usar categorías]"] + category_cols + [c for c in df.columns if c not in category_cols], key="col_cat"
+                cat_option = st.selectbox(
+                    "Categoría",
+                    options=["[No usar categorías]"] + remaining_for_category,
+                    key="col_cat",
                 )
-                if col_cat == "[No usar categorías]":
-                    col_cat = None
+                col_cat = None if cat_option == "[No usar categorías]" else cat_option
             with sel_col4:
                 # Selección de frecuencia
                 mapa_freq = {
@@ -492,40 +468,24 @@ def main() -> None:
                     "Frecuencia", list(mapa_freq.keys()), index=2, key="freq"
                 )
                 freq_final = mapa_freq[freq_es]
-            # Formato de fecha personalizado y opciones avanzadas en un expander
-            with st.expander("Opciones", expanded=False):
-                use_custom_format = st.checkbox(
-                    "Usar formato de fecha personalizado", value=False, key="use_custom_format"
-                )
-                custom_date_format = None
-                if use_custom_format:
-                    custom_date_format = st.text_input(
-                        "Formato de fecha (ej: %d/%m/%Y)",
-                        help=(
-                            "Ingresa el formato de fecha según la convención de Python. Ejemplos:\n"
-                            "%d/%m/%Y para 31/12/2023\n%Y-%m-%d para 2023-12-31"
-                        ),
+            show_custom_format = st.checkbox(
+                "Ingresar formato de fecha personalizado",
+                value=False,
+                key="toggle_custom_date_format",
+            )
+            custom_date_format = None
+            if show_custom_format:
+                custom_date_format = (
+                    st.text_input(
+                        "Formato de fecha (ej. %d/%m/%Y)",
+                        value="",
                         key="custom_date_format",
-                    )
-                handle_outliers = st.checkbox(
-                    "Detectar valores atípicos", value=False, key="outliers"
+                    ).strip()
+                    or None
                 )
-                date_range_filter = st.checkbox(
-                    "Filtrar por rango de fechas", value=False, key="date_range_filter"
-                )
-                date_range = None
-                if date_range_filter:
-                    temp_dates = parse_dates(df, col_fecha, custom_date_format)
-                    if temp_dates.notna().any():
-                        min_date = temp_dates.min().date()
-                        max_date = temp_dates.max().date()
-                        date_range = st.date_input(
-                            "Selecciona el rango de fechas",
-                            value=(min_date, max_date),
-                            min_value=min_date,
-                            max_value=max_date,
-                            key="date_range",
-                        )
+            handle_outliers = False
+            date_range_filter = False
+            date_range = None
             # Procesamiento de datos
             with st.spinner("Procesando datos..."):
                 processed_df = preprocess_data(df, col_fecha, col_valor, col_cat, freq_final, custom_date_format)
@@ -539,9 +499,6 @@ def main() -> None:
                 # Verificar si la columna de categoría tiene un único valor
                 actual_cat = col_cat or "__cat__"
                 if processed_df[actual_cat].nunique() == 1:
-                    st.warning(
-                        f"La columna de categoría seleccionada solo contiene un valor único. Se utilizará 'Serie única' como categoría."
-                    )
                     processed_df["__cat__"] = "Serie única"
                     actual_cat = "__cat__"
                 # Lista de categorías
@@ -549,21 +506,6 @@ def main() -> None:
                 if not categorias:
                     st.error("No se encontraron categorías válidas para el análisis")
                     return
-                # Mostrar estadísticas básicas en un expander para una interfaz más limpia
-                st.subheader("Estadísticas básicas")
-                with st.expander("Ver estadísticas", expanded=False):
-                    col_stats1, col_stats2 = st.columns(2)
-                    with col_stats1:
-                        st.write("Resumen de valores")
-                        st.dataframe(processed_df[col_valor].describe())
-                    with col_stats2:
-                        st.write("Conteo por categoría")
-                        cat_counts = (
-                            processed_df.groupby(actual_cat)
-                            .size()
-                            .reset_index(name="count")
-                        )
-                        st.dataframe(cat_counts)
                 # Advertencias de calidad de datos
                 warnings_list: List[str] = []
                 # Fechas faltantes (solo para frecuencia diaria)
@@ -586,8 +528,14 @@ def main() -> None:
                     with st.expander("⚠️ Advertencias de calidad de datos"):
                         for w in warnings_list:
                             st.warning(w)
+                # Calcular métricas comparativas para visualizaciones Altair
+                processed_df["Promedio pares"] = (
+                    processed_df.groupby("Fecha")[col_valor].transform("mean")
+                )
+                processed_df["Delta vs pares"] = processed_df[col_valor] - processed_df["Promedio pares"]
+
                 # Descomposición por categoría
-                st.subheader("Descomposición y visualización")
+                st.info("Analizando componentes por categoría…")
                 per_cat: Dict[str, Dict[str, pd.Series]] = {}
                 progress_bar = st.progress(0)
                 for idx, cat in enumerate(categorias):
@@ -600,9 +548,6 @@ def main() -> None:
                         per_cat[cat] = {
                             "x": sub_df["Fecha"],
                             "y": sub_df[col_valor],
-                            "y_g": sub_df["g"],
-                            "x_box": sub_df["Periodo"],
-                            "y_box": sub_df["g"],
                             "y_trend": decomp["trend"],
                             "y_season": decomp["season"],
                             "model": "Multiplicativo" if decomp["model_mode"] == ModelMode.MULTIPLICATIVE else "Aditivo",
@@ -617,159 +562,217 @@ def main() -> None:
                 if not per_cat:
                     st.error("No se pudieron generar visualizaciones. Verifica la calidad de los datos.")
                     return
-                # Mostrar tipo de modelo para la primera categoría
-                first_cat = next(iter(per_cat))
-                st.info(f"Modelo detectado para la primera categoría ('{first_cat}'): {per_cat[first_cat]['model']}")
-                # Construir figura con distribución de filas personalizada para evitar superposición
-                fig = make_subplots(
-                    rows=5,
-                    cols=1,
-                    row_heights=[3, 2, 2, 2, 2],
-                    vertical_spacing=0.04,
-                    subplot_titles=(
-                        "Serie original",
-                        "Crecimiento (%)",
-                        "Estacionalidad",
-                        "Tendencia",
-                        "Distribución estacional (boxplot)",
-                    ),
+
+                palette = {
+                    "serie": "#006d77",
+                    "pares": "#83c5be",
+                    "delta_pos": "#55a630",
+                    "delta_neg": "#d62828",
+                    "growth": "#023e8a",
+                    "trend": "#9d4edd",
+                    "season": "#ffb703",
+                }
+
+                seleccionadas = st.multiselect(
+                    "Selecciona categorías para visualizar",
+                    categorias,
+                    default=[categorias[0]] if categorias else [],
                 )
-                trace_map: Dict[str, List[int]] = {}
-                trace_idx = 0
-                for cat in categorias:
-                    if cat not in per_cat:
-                        continue
-                    s = per_cat[cat]
-                    # Serie original
-                    fig.add_trace(
-                        go.Scatter(
-                            x=s["x"], y=s["y"], mode="lines+markers", name=f"Serie - {cat}", visible=False, line=dict(width=2)
-                        ),
-                        row=1,
-                        col=1,
+
+                if not seleccionadas:
+                    st.warning("Selecciona al menos una categoría para mostrar las tarjetas analíticas.")
+
+                metric_labels = {
+                    col_valor: "Serie",
+                    "Promedio pares": "Promedio de pares",
+                    "Delta vs pares": "Delta vs pares",
+                }
+
+                valid_categories = [cat for cat in seleccionadas if cat in per_cat]
+                missing_categories = set(seleccionadas) - set(valid_categories)
+                if missing_categories:
+                    st.warning(
+                        "Las siguientes categorías no pudieron procesarse: "
+                        + ", ".join(sorted(missing_categories))
                     )
-                    idx1 = trace_idx
-                    trace_idx += 1
-                    # Outliers en serie original
-                    if "outliers_x" in s:
-                        fig.add_trace(
-                            go.Scatter(
-                                x=s["outliers_x"],
-                                y=s["outliers_y"],
-                                mode="markers",
-                                marker=dict(color="red", size=10, symbol="x"),
-                                name=f"Outliers - {cat}",
-                                visible=False,
+
+                if valid_categories:
+                    seleccion_df = processed_df[processed_df[actual_cat].isin(valid_categories)].copy()
+
+                    with st.container(border=True):
+                        st.markdown("**Crecimiento porcentual**")
+                        opciones_crecimiento = GROWTH_OFFSETS_BY_FREQ.get(freq_final, {})
+                        if not opciones_crecimiento:
+                            st.info("No hay métricas de crecimiento disponibles para la frecuencia seleccionada.")
+                        else:
+                            growth_type = st.selectbox(
+                                "Tipo de crecimiento",
+                                list(opciones_crecimiento.keys()),
+                                key="growth_type_chart",
+                            )
+                            growth_df = calculate_growth(
+                                seleccion_df,
+                                actual_cat,
+                                col_valor,
+                                freq_final,
+                                growth_type,
+                            )
+                            growth_df = growth_df.dropna(subset=["Crecimiento"])
+                            has_growth_rows = len(growth_df.index) > 0
+                            if not has_growth_rows:
+                                st.info("No hay datos suficientes para calcular el crecimiento seleccionado.")
+                            else:
+                                growth_chart = (
+                                    alt.Chart(growth_df.rename(columns={actual_cat: "Categoría"}))
+                                    .mark_line(point=True)
+                                    .encode(
+                                        x=alt.X("Fecha:T", title="Fecha"),
+                                        y=alt.Y("Crecimiento:Q", title="Crecimiento (%)"),
+                                        color=alt.Color("Categoría:N", title="Categoría"),
+                                    )
+                                    .properties(height=240)
+                                    .configure_axis(grid=False)
+                                    .configure_legend(orient="bottom")
+                                )
+                                st.altair_chart(growth_chart, use_container_width=True)
+
+                    trend_frames = [
+                        pd.DataFrame(
+                            {
+                                "Fecha": per_cat[cat]["x"],
+                                "Tendencia": per_cat[cat]["y_trend"].values,
+                                "Categoría": cat,
+                            }
+                        )
+                        for cat in valid_categories
+                    ]
+                    combined_trend = (
+                        pd.concat(trend_frames, ignore_index=True)
+                        if trend_frames
+                        else pd.DataFrame(columns=["Fecha", "Tendencia", "Categoría"])
+                    )
+                    combined_trend = combined_trend.dropna(subset=["Tendencia"])
+                    has_trend_rows = len(combined_trend.index) > 0
+                    if has_trend_rows:
+                        tendencia_chart = (
+                            alt.Chart(combined_trend)
+                            .mark_line(point=True)
+                            .encode(
+                                x=alt.X("Fecha:T", title="Fecha"),
+                                y=alt.Y("Tendencia:Q", title="Tendencia"),
+                                color=alt.Color("Categoría:N", title="Categoría"),
+                            )
+                            .properties(height=240)
+                            .configure_axis(grid=False)
+                            .configure_legend(orient="bottom")
+                        )
+                        with st.container(border=True):
+                            st.markdown("**Tendencia por categoría**")
+                            st.altair_chart(tendencia_chart, use_container_width=True)
+
+                for cat in valid_categories:
+                    st.markdown(f"### {cat}")
+                    cat_df = processed_df[processed_df[actual_cat] == cat].copy()
+                    if cat_df.empty:
+                        st.warning(f"No hay datos disponibles para la categoría '{cat}'.")
+                        continue
+
+                    cat_df["Signo delta"] = np.where(cat_df["Delta vs pares"] >= 0, "Por encima", "Por debajo")
+
+                    melted = cat_df.melt(
+                        id_vars=["Fecha", actual_cat],
+                        value_vars=list(metric_labels.keys()),
+                        var_name="variable",
+                        value_name="Valor",
+                    )
+                    melted["Métrica"] = melted["variable"].map(metric_labels)
+
+                    line_df = melted[melted["Métrica"].isin(["Serie", "Promedio de pares"])].copy()
+                    linea_chart = (
+                        alt.Chart(line_df)
+                        .mark_line(point=True)
+                        .encode(
+                            x=alt.X("Fecha:T", title="Fecha"),
+                            y=alt.Y("Valor:Q", title="Nivel"),
+                            color=alt.Color(
+                                "Métrica:N",
+                                scale=alt.Scale(range=[palette["serie"], palette["pares"]]),
+                                legend=alt.Legend(orient="bottom"),
                             ),
-                            row=1,
-                            col=1,
                         )
-                        trace_idx += 1
-                    # Crecimiento
-                    fig.add_trace(
-                        go.Scatter(
-                            x=s["x"], y=s["y_g"], mode="lines+markers", name=f"Crec. - {cat}", visible=False, line=dict(width=2)
-                        ),
-                        row=2,
-                        col=1,
+                        .properties(height=260)
+                        .configure_axis(grid=False)
+                        .configure_legend(orient="bottom")
                     )
-                    idx2 = trace_idx
-                    trace_idx += 1
-                    # Estacionalidad
-                    fig.add_trace(
-                        go.Scatter(
-                            x=s["x"],
-                            y=s["y_season"],
-                            mode="lines+markers",
-                            name=f"Estacionalidad - {cat}",
-                            visible=False,
-                            marker=dict(symbol="square"),
-                            line=dict(width=2),
-                        ),
-                        row=3,
-                        col=1,
-                    )
-                    idx3 = trace_idx
-                    trace_idx += 1
-                    # Tendencia
-                    fig.add_trace(
-                        go.Scatter(
-                            x=s["x"],
-                            y=s["y_trend"],
-                            mode="lines",
-                            name=f"Tendencia - {cat}",
-                            visible=False,
-                            line=dict(width=2, dash="dash"),
-                        ),
-                        row=4,
-                        col=1,
-                    )
-                    idx4 = trace_idx
-                    trace_idx += 1
-                    # Boxplot
-                    fig.add_trace(
-                        go.Box(
-                            x=s["x_box"],
-                            y=s["y_box"],
-                            boxmean=True,
-                            name=f"Box estacionalidad - {cat}",
-                            visible=False,
-                        ),
-                        row=5,
-                        col=1,
-                    )
-                    idx5 = trace_idx
-                    trace_idx += 1
-                    trace_map[cat] = [idx1, idx2, idx3, idx4, idx5]
-                # Crear botones
-                n_traces = len(fig.data)
-                buttons = []
-                for cat in categorias:
-                    if cat not in trace_map:
-                        continue
-                    vis = [False] * n_traces
-                    for k in trace_map[cat]:
-                        vis[k] = True
-                    buttons.append(
-                        dict(
-                            label=str(cat),
-                            method="update",
-                            args=[{"visible": vis}, {"title": f"Dashboard SHF - {cat}"}],
+
+                    delta_chart = (
+                        alt.Chart(cat_df)
+                        .mark_area(opacity=0.6)
+                        .encode(
+                            x=alt.X("Fecha:T", title="Fecha"),
+                            y=alt.Y("Delta vs pares:Q", title="Diferencia"),
+                            color=alt.Color(
+                                "Signo delta:N",
+                                scale=alt.Scale(range=[palette["delta_pos"], palette["delta_neg"]]),
+                                legend=alt.Legend(title="", orient="bottom"),
+                            ),
                         )
+                        .properties(height=260)
+                        .configure_axis(grid=False)
+                        .configure_legend(orient="bottom")
                     )
-                # Configuración inicial de visibilidad para la primera categoría
-                if categorias:
-                    inicio = categorias[0]
-                    if inicio in trace_map:
-                        initial_vis = [False] * n_traces
-                        for idx in trace_map[inicio]:
-                            initial_vis[idx] = True
-                        for i, tr in enumerate(fig.data):
-                            tr.visible = initial_vis[i]
-                    fig.update_layout(
-                        updatemenus=[dict(buttons=buttons, direction="down", x=0.01, y=1.15)],
-                        title=f"Dashboard SHF - {inicio}",
-                        height=1600,
-                        template="plotly_white",
-                        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+
+                    col_linea, col_delta = st.columns(2)
+                    with col_linea:
+                        with st.container(border=True):
+                            st.markdown("**Serie vs. promedio de pares**")
+                            st.altair_chart(linea_chart, use_container_width=True)
+                    with col_delta:
+                        with st.container(border=True):
+                            st.markdown("**Delta contra pares**")
+                            st.altair_chart(delta_chart, use_container_width=True)
+
+                    season_series = per_cat[cat]["y_season"].copy()
+                    season_title = "Estacionalidad"
+                    if per_cat[cat]["model"] == "Multiplicativo":
+                        season_series = (season_series - 1) * 100
+                        season_title = "Estacionalidad (%)"
+
+                    tendencia_estacionalidad = pd.DataFrame(
+                        {
+                            "Fecha": per_cat[cat]["x"],
+                            "Estacionalidad": season_series.values,
+                        }
                     )
-                    # Ocultar etiquetas del eje x en las primeras cuatro filas para evitar superposición
-                    for row_num in range(1, 5):
-                        fig.update_xaxes(showticklabels=False, row=row_num, col=1)
-                # Ordenar la x del boxplot según periodo
-                orden = []
-                if freq_final == "Q":
-                    orden = ["Q1", "Q2", "Q3", "Q4"]
-                elif freq_final == "M":
-                    orden = [calendar.month_abbr[i] for i in range(1, 13)]
-                elif freq_final == "W":
-                    orden = sorted(processed_df["Periodo"].unique().tolist(), key=lambda x: int(x.split(" ")[1]))
-                elif freq_final == "A":
-                    orden = sorted(processed_df["Periodo"].unique().tolist())
-                else:
-                    orden = ["Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom"]
-                fig.update_xaxes(categoryorder="array", categoryarray=orden, row=5, col=1)
-                st.plotly_chart(fig, use_container_width=True)
+
+                    estacionalidad_chart = (
+                        alt.Chart(tendencia_estacionalidad)
+                        .mark_line(color=palette["season"])
+                        .encode(
+                            x=alt.X("Fecha:T", title="Fecha"),
+                            y=alt.Y("Estacionalidad:Q", title=season_title),
+                        )
+                        .properties(height=220)
+                        .configure_axis(grid=False)
+                    )
+
+                    with st.container(border=True):
+                        st.markdown("**Estacionalidad**")
+                        st.altair_chart(estacionalidad_chart, use_container_width=True)
+
+                st.subheader("Estadísticas básicas")
+                col_stats1, col_stats2 = st.columns(2)
+                with col_stats1:
+                    st.write("Resumen de valores")
+                    st.dataframe(processed_df[col_valor].describe())
+                with col_stats2:
+                    st.write("Conteo por categoría")
+                    cat_counts = (
+                        processed_df.groupby(actual_cat)
+                        .size()
+                        .reset_index(name="count")
+                    )
+                    st.dataframe(cat_counts)
         else:
             st.info("Carga un archivo para comenzar el análisis.")
 
