@@ -1,7 +1,13 @@
-streamlit
-pandas
-numpy
-plotly
-darts
-openpyxl
-pyarrow
+# Core
+streamlit>=1.30
+pandas>=2.0
+numpy>=1.24
+altair>=5.0
+
+# Time series (Darts)
+u8darts>=0.27
+
+# Lectura de archivos
+pyarrow>=12.0      # para leer .parquet con pandas
+openpyxl>=3.1      # para leer .xlsx
+xlrd<2.0.0         # para leer .xls (formato viejo)
