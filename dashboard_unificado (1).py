@@ -14,6 +14,15 @@ from darts import TimeSeries
 from darts.utils.statistics import ModelMode, extract_trend_and_seasonality
 import streamlit as st
 
+# Ocultar la barra de Streamlit (hamburger menu y footer)
+hide_streamlit_style = """
+    <style>
+    #MainMenu {visibility: hidden;}
+    footer {visibility: hidden;}
+    header {visibility: hidden;}
+    </style>
+"""
+st.markdown(hide_streamlit_style, unsafe_allow_html=True)
 
 # -----------------------------------------------------------------------------
 # Configuración inicial y supresión de advertencias
